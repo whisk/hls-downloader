@@ -1,0 +1,190 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'tmpdir'
+require 'net/http'
+
+VERSION = '0.1'
+LOGLEVEL = { info: 1, verbose: 2, debug: 3 }
+
+class HlsDownloader
+  def initialize(args = {})
+    @args = args
+    @args[:verbosity] ||= LOGLEVEL[:info]
+    @args[:threads] ||= 8
+  end
+
+  def debug(*args)
+    puts format(*args) if @args[:verbosity] >= LOGLEVEL[:debug]
+  end
+
+  def verbose(*args)
+    puts format(*args) if @args[:verbosity] >= LOGLEVEL[:verbose]
+  end
+
+  def save(from_url, to_path)
+    check_path(to_path)
+    Dir.mktmpdir do |tmp_dir|
+      verbose('Saving to %s', tmp_dir)
+      chunks = download(from_url, tmp_dir, @args[:threads])
+      concat(chunks, to_path)
+    end
+  end
+
+  def check_path(to_path)
+    raise 'Only single mp4 supported for output' unless to_path =~ /.mp4$/
+    true
+  end
+
+  def check_playlist_data(playlist_data)
+    debug('Checking playlist data: %s symbols', playlist_data.size)
+    raise 'Not an HLS playlist' unless playlist_data =~ /^#EXTM3U/
+    true
+  end
+
+  def download(from_url, tmp_dir, threads)
+    playlist_url = get_video_playlist_url(from_url)
+    download_chunks(playlist_url, tmp_dir, threads)
+  end
+
+  def concat(chunks, to_path)
+    joined_chunks = chunks.join('|')
+    `ffmpeg -y -i "concat:#{joined_chunks}" -c copy -bsf:a aac_adtstoasc #{to_path}`
+  end
+
+  def get_video_playlist_url(url)
+    playlist_data = Net::HTTP.get(URI(url))
+    check_playlist_data(playlist_data)
+
+    if playlist_data =~ /^#EXT-X-STREAM-INF/
+      parse_playlist_l1(playlist_data, url).last[:url]
+    else
+      url
+    end
+  end
+
+  def parse_playlist_l1(playlist_data, base_url)
+    streams = []
+    playlist_data = playlist_data.split("\n")
+    i = 0
+    while i < playlist_data.size
+      m = playlist_data[i].match(/^#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/)
+      if m
+        streams << {
+          bandwidth: m[1].to_i,
+          url: expand_url(base_url, playlist_data[i + 1])
+        }
+        i += 1
+      end
+      i += 1
+    end
+    streams.sort! { |a, b| a[:bandwidth] <=> b[:bandwidth] }
+
+    raise "No level2 playlists found in #{base_url}" if streams.empty?
+    streams
+  end
+
+  def expand_url(base_url, url)
+    URI.parse(url).host ? url : URI.join(base_url, url).to_s
+  end
+
+  def download_chunks(playlist_url, tmp_dir, threads_cnt)
+    chunks = []
+    threads = []
+    chunk_urls = get_chunk_urls(playlist_url)
+    q = Queue.new
+    chunk_urls.size.times.each { |i| q << i }
+    threads_cnt.times do |ti|
+      debug('Starting thread %i', ti)
+      threads << Thread.new do
+        loop do
+          begin
+            url_idx = q.pop(true)
+            fname = File.join(tmp_dir, format('%08d.ts', url_idx))
+            download_chunk(expand_url(playlist_url, chunk_urls[url_idx]), fname)
+            chunks << fname
+          rescue StandardError
+            debug('Qeued exhausted for thread %i', ti)
+            break
+          end
+        end
+      end
+    end
+    threads.each(&:join)
+
+    chunks.sort
+  end
+
+  def get_chunk_urls(playlist_url)
+    playlist_data = Net::HTTP.get(URI(playlist_url))
+    check_playlist_data(playlist_data)
+    playlist_data = playlist_data.split("\n")
+    i = 0
+    urls = []
+    while i < playlist_data.size
+      m = playlist_data[i].match(/^#EXTINF:/)
+      if m
+        urls << expand_url(playlist_url, playlist_data[i + 1])
+        i += 1
+      end
+      i += 1
+    end
+
+    raise "No chunk urls found in #{playlist_url}" if urls.empty?
+    urls
+  end
+
+  def download_chunk(url, fname)
+    verbose('Saving chunk %s -> %s', url, fname)
+    raise "File #{fname} not writable" if FileTest.writable?(fname)
+    uri = URI.parse(url)
+    Net::HTTP.start(uri.host, uri.port) do |http|
+      req = Net::HTTP::Get.new(url)
+      http.request(req) do |res|
+        File.open(fname, 'w') do |io|
+          res.read_body do |data|
+            io.write(data)
+          end
+        end
+      end
+    end
+  end
+end
+
+args = {}
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{__FILE__} <m3u8> <mp4 path> [options]"
+  opts.on('-tN', 'Number of downloading threads') do |t|
+    args[:threads] = t
+  end
+  opts.on('-V', '--version', 'Print version') do
+    puts VERSION
+    exit
+  end
+  opts.on('-v', '--verbose', 'Be verbose') do
+    args[:verbosity] = LOGLEVEL[:verbose]
+  end
+  opts.on('-d', '--debug', 'Debug mode') do
+    args[:verbosity] = LOGLEVEL[:debug]
+  end
+end
+
+parser.parse!
+
+url = ARGV[0]
+filename = ARGV[1]
+if !url || !filename
+  puts parser
+  exit 1
+end
+
+d = HlsDownloader.new(args)
+
+# download HLS and save as mp4
+# get highest bitrate if given, otherwise throw error
+begin
+  d.save(url, filename)
+rescue StandardError => e
+  puts e
+  puts e.backtrace if args[:verbosity] >= LOGLEVEL[:debug]
+end
